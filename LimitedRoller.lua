@@ -334,7 +334,7 @@ local Game = {
 -- small mutable bits of the rolling / selling / claiming logic
 local Roll = { fails = 0, fellBack = false, home = nil, caseBlockedUntil = 0, openRetryAt = 0, collected = false, lastTeleport = -1e9 }
 local Sell = {}
-local Claims = { goalStyle = nil, data = nil }
+local Claims = { data = nil }
 local Busy = {}
 
 -- numbers worked out from the mirror, refreshed by the window loop (see "derived values")
@@ -389,9 +389,16 @@ end
 
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 20)
 local Shared = ReplicatedStorage:WaitForChild("Shared", 20)
-if not (Remotes and Shared and Remotes:FindFirstChild("RequestRoll")) then
-	warn("[Limited Roller] the game's Remotes/Shared folders were not found: is this the right game?")
+if not (Remotes and Shared) then
+	local text = "Limited Roller: ReplicatedStorage." .. (Remotes and "Shared" or "Remotes") .. " not found (wrong game, wrong place, or the game changed)"
+	warn("[Limited Roller] " .. text)
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("SendNotification", { Title = "Limited Roller", Text = text, Duration = 10 })
+	end)
 	return
+end
+if not Remotes:FindFirstChild("RequestRoll") then
+	warn("[Limited Roller] the RequestRoll remote is missing: rolling won't work until the game is the expected one")
 end
 
 local R = setmetatable({}, {
@@ -429,6 +436,7 @@ do
 	Mod.Gem = load(Shared, "GemConfig")
 	Mod.Coin = load(Shared, "CoinShopConfig")
 	Mod.Equip = load(Shared, "EquipConfig")
+	Mod.Variant = load(Shared, "VariantConfig")
 	Mod.Rewards = load(Shared, "RewardsConfig")
 	Mod.Upgrades = load(scripts, "UpgradesController")
 	Mod.CasesUI = load(scripts, "CasesController")
@@ -670,8 +678,8 @@ function Net.sync()
 	for key, value in pairs(result) do
 		table.insert(keys, tostring(key))
 		if key == "QuestInfo" then
-			Game.Quests = value
-		else
+			Game.Quests = value -- the ClientController reads the quests from QuestInfo; the result also has a `Quests` key of its own
+		elseif key ~= "Quests" then
 			Game[key] = value
 		end
 	end
@@ -966,7 +974,9 @@ function Act.rollOnce()
 	if reply then
 		Roll.fails = 0
 		Act.applyRoll(reply)
-		return Cfg.rollDelay
+		-- Stats.Cooldown is the server's own gap between rolls (the Roll Speed upgrade lowers it); asking sooner only gets "slow down"
+		local cooldown = type(Game.Stats) == "table" and tonumber(Game.Stats.Cooldown) or 0
+		return math.max(Cfg.rollDelay, cooldown > 0 and cooldown + 0.03 or 0)
 	end
 	if raw == nil then
 		Roll.fails += 1
@@ -1172,8 +1182,13 @@ Shop.cats.skills = {
 	owned = function(_, node)
 		return Game.Skills[node.Id] ~= nil and Game.Skills[node.Id] ~= false
 	end,
-	gate = function()
-		return Mod.gate("Upgrades", "HasAffordable", Game)
+	-- the Upgrades window's own CanBuy: prerequisites and the rolls an upgrade asks for (Auto Roll: 10)
+	eligible = function(_, node)
+		return safe(Mod.Skill and Mod.Skill.CanBuy, Game.Skills, node.Id, Game.TotalRolls) ~= false
+	end,
+	-- GetCost scales with rebirths; 0 means free
+	cost = function(node)
+		return tonumber(safe(Mod.Skill and Mod.Skill.GetCost, node, Game.Rebirths)) or Shop.nodeCost(node)
 	end,
 	buy = function(_, node)
 		local reply, reason = Net.call("BuySkill", node.Id)
@@ -1293,8 +1308,19 @@ Shop.cats.slots = {
 	candidates = function()
 		return { SLOT_NODE }
 	end,
+	-- CoinShopConfig.GetNextSlotPrice(slots bought): the gem price of the next pedestal, nil once every slot is open
 	owned = function()
+		local fn = Mod.Coin and Mod.Coin.GetNextSlotPrice
+		if type(fn) == "function" then
+			local ok, price = pcall(fn, Game.DisplaySlots or 0)
+			if ok then
+				return price == nil
+			end
+		end
 		return false
+	end,
+	cost = function()
+		return tonumber(safe(Mod.Coin and Mod.Coin.GetNextSlotPrice, Game.DisplaySlots or 0))
 	end,
 	buy = function()
 		local reply, reason = Net.call("BuyDisplaySlot")
@@ -1382,7 +1408,7 @@ function Shop.run(name, manual)
 			break
 		end
 		local node = entry.node
-		if not cat:owned(node) then
+		if not cat:owned(node) and (not cat.eligible or cat:eligible(node)) then
 			local st = cat.state[node.Id]
 			if not st then
 				st = { fails = 0, nextTry = 0, funds = 0 }
@@ -1393,7 +1419,14 @@ function Shop.run(name, manual)
 			if st.nextTry > 0 and funds >= st.funds * 1.5 + 1 then
 				st.nextTry = 0
 			end
-			if funds > 0 and not (entry.cost and entry.cost > funds) and (manual or now() >= st.nextTry) then
+			-- a known price must fit the funds (a free one always does); an unknown one needs at least something to spend
+			local affordable
+			if entry.cost then
+				affordable = entry.cost <= funds
+			else
+				affordable = funds > 0
+			end
+			if affordable and (manual or now() >= st.nextTry) then
 				attempts += 1
 				setActivity("Buying " .. cat.label .. "...")
 				local ok, info = cat:buy(node)
@@ -1423,8 +1456,7 @@ function Shop.runEnabled(manual)
 end
 
 --// actions: claiming
--- Daily, gifts, the collection rewards and quests follow what RewardsController and GemsController send. Goals are the one thing
--- here still guessed (AchievementsController hasn't been seen): the claim-all form is tried first, then one call per goal.
+-- Daily, gifts, collection rewards, quests and goals follow what RewardsController, GemsController and AchievementsController send.
 
 -- the whole rewards state: { Ok, Gifts = { { Claimed, ReadyIn } }, Daily = { CanClaim, ... }, Tiers = { [rarity] = { Found,
 -- Total, Claimed } }, Collection = { [milestoneId] = true }, Discovered }
@@ -1535,14 +1567,18 @@ function Claims.goals()
 	if type(Game.GoalsReady) ~= "table" or next(Game.GoalsReady) == nil then
 		return
 	end
-	if Claims.goalStyle ~= "each" then
-		local reply, _, raw = Net.call("ClaimGoal")
+	-- Goals window: CLAIM ALL sends ("all"), a single card sends its achievement id (the keys of GoalsReady)
+	local count = 0
+	for _ in pairs(Game.GoalsReady) do
+		count += 1
+	end
+	if count > 1 then
+		local reply, _, raw = Net.call("ClaimGoal", "all")
 		if reply then
-			Claims.goalStyle = "all"
 			goalReply(reply)
 			return
 		end
-		if raw == nil or Claims.goalStyle == "all" then
+		if raw == nil then
 			return
 		end
 	end
@@ -1557,7 +1593,6 @@ function Claims.goals()
 			Game.GoalsReady[id] = nil -- not ready after all; the next sync puts it back if it is
 			break
 		end
-		Claims.goalStyle = "each"
 		goalReply(reply, id)
 	end
 end
@@ -1675,8 +1710,83 @@ function Act.collectVault()
 	end)
 end
 
+-- The offering a rebirth needs (RebirthOfferController). Some rebirths ask for mutated items (GetRebirthMutationNeeds:
+-- { { variantName, count }, ... }, "or rarer"); the window's "Auto-pick cheapest" fills them from the rarest need down with the
+-- lowest-tier items that are rare enough, cheapest first, never copies already carried over a past rebirth. This does the same,
+-- but leaves locked items out: giving those up is for the player to decide. Returns the picks ({ [itemId] = copies }) and
+-- whether they cover everything asked.
+function Act.rebirthOffer()
+	local P, V = Mod.Prog, Mod.Variant
+	local needs = safe(P and P.GetRebirthMutationNeeds, Game.Rebirths or 0)
+	if type(needs) ~= "table" or #needs == 0 then
+		return {}, true
+	end
+	if not (V and type(V.GetTier) == "function" and type(V.Parse) == "function") then
+		return {}, false
+	end
+	local function tierOf(need)
+		return tonumber(safe(V.GetTier, need[1])) or 0
+	end
+	local lowest = math.huge
+	for _, need in ipairs(needs) do
+		lowest = math.min(lowest, tierOf(need))
+	end
+	local carried = Game.Carried or {}
+	local list = {}
+	for id, count in pairs(Game.Items) do
+		if type(count) == "number" then
+			local _, variant = safe(V.Parse, id)
+			if type(variant) == "table" and type(variant.Tier) == "number" and Game.Locked[id] ~= true and variant.Tier >= lowest then
+				local free = count - math.min(carried[id] or 0, count)
+				if free > 0 then
+					table.insert(list, { id = id, tier = variant.Tier, free = free, value = Mod.value(id) })
+				end
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		if a.tier ~= b.tier then
+			return a.tier < b.tier
+		end
+		if a.value ~= b.value then
+			return a.value < b.value
+		end
+		return tostring(a.id) < tostring(b.id)
+	end)
+	local order = table.clone(needs)
+	table.sort(order, function(a, b)
+		return tierOf(a) > tierOf(b)
+	end)
+	local picks, covered = {}, true
+	for _, need in ipairs(order) do
+		local tier, remaining = tierOf(need), need[2]
+		for _, candidate in ipairs(list) do
+			if remaining <= 0 then
+				break
+			end
+			if tier <= candidate.tier then
+				local take = math.min(candidate.free - (picks[candidate.id] or 0), remaining)
+				if take > 0 then
+					picks[candidate.id] = (picks[candidate.id] or 0) + take
+					remaining -= take
+				end
+			end
+		end
+		if remaining > 0 then
+			covered = false
+		end
+	end
+	-- the window only lets the offering through when the game's own check agrees
+	if covered then
+		local ok, passed = pcall(P.CheckRebirthMutations, Game.Rebirths or 0, picks, nil)
+		covered = not ok or passed ~= false
+	end
+	return picks, covered
+end
+
 -- The Rebirth button's own test (RanksController): enough value, the mutations this rebirth asks for, not at the maximum, and
--- no perk waiting to be picked. The second result says which part is missing.
+-- no perk waiting to be picked; plus an offering that can be made without touching locked items. The second result says which
+-- part is missing.
 function Act.rebirthStatus()
 	local P = Mod.Prog
 	local rebirths = Game.Rebirths or 0
@@ -1693,10 +1803,16 @@ function Act.rebirthStatus()
 	local max = P and type(P.Rebirth) == "table" and tonumber(P.Rebirth.MaxRebirths) or math.huge
 	local maxed = rebirths >= max
 	local perk = Game.PerkChoice ~= nil
-	return valueOk and mutationsOk and not maxed and not perk, {
+	local offerOk = true
+	if valueOk and mutationsOk and not maxed and not perk then
+		local _, covered = Act.rebirthOffer()
+		offerOk = covered
+	end
+	return valueOk and mutationsOk and offerOk and not maxed and not perk, {
 		valueOk = valueOk,
 		mutationsOk = mutationsOk,
 		mutationNeed = mutationNeed,
+		offerOk = offerOk,
 		maxed = maxed,
 		perk = perk,
 	}
@@ -1709,7 +1825,14 @@ end
 function Act.rebirth()
 	return guard("rebirth", function()
 		setActivity("Rebirthing...", "warn")
-		local reply, reason = Net.call("Rebirth", {})
+		local picks, covered = Act.rebirthOffer()
+		if not covered then
+			logOnce("rebirthoffer", "Rebirth: the mutations it needs are locked or missing", "warn", 60)
+			return false
+		end
+		-- the window's CONFIRM sends the offering and the items to protect; nothing extra is protected here, locked, worn and
+		-- displayed items are kept by the game itself
+		local reply, reason = Net.call("Rebirth", { Mutations = picks, Protect = {} })
 		if not reply then
 			logOnce("rebirth", "Rebirth refused: " .. tostring(reason), "warn", 30)
 			return false
@@ -2786,6 +2909,7 @@ do
 	ui.info.time = add("Running for")
 	ui.info.case = add("Case")
 	ui.info.auto = add("Auto roll")
+	ui.info.cooldown = add("Roll cooldown")
 	ui.info.zone = add("Zone")
 	ui.info.rolls = add("Rolls (all time)")
 	ui.info.items = add("Items / new")
@@ -2906,7 +3030,7 @@ do
 	toggleRow(page, "Gifts", "claimGifts")
 	toggleRow(page, "Collection rewards", "claimCollection")
 	toggleRow(page, "Quests", "claimQuests")
-	toggleRow(page, "Goals (best effort)", "claimGoals")
+	toggleRow(page, "Goals", "claimGoals")
 	buttonRow(page, {
 		{
 			"Claim everything now",
@@ -3020,6 +3144,7 @@ function ui.debugText()
 		{ "GemConfig", "Gem" },
 		{ "CoinShopConfig", "Coin" },
 		{ "EquipConfig", "Equip" },
+		{ "VariantConfig", "Variant" },
 		{ "RewardsConfig", "Rewards" },
 		{ "UpgradesController", "Upgrades" },
 		{ "CasesController", "CasesUI" },
@@ -3039,7 +3164,6 @@ function ui.debugText()
 			add(string.format("%s: %d nodes, first %s", name, #cat.list, first and dump(first) or "-"))
 		end
 	end
-	add("goal claim form: " .. tostring(Claims.goalStyle))
 	add("sell: rarities " .. dump(Cfg.sellRarities) .. ", all copies " .. tostring(Cfg.sellAll) .. ", keep mutated " .. tostring(Cfg.sellKeep))
 	add("rebirth: " .. dump(select(2, Act.rebirthStatus())) .. ", needs " .. tostring(Derived.rebirthNeed))
 	add("Stats: " .. dump(Game.Stats))
@@ -3173,6 +3297,8 @@ local function refresh()
 		info.case.Text = selected and tostring(cases[selected].Name or cases[selected].Id) or "?"
 		local auto = type(Game.Stats) == "table" and Game.Stats.AutoRoll == true
 		info.auto.Text = auto and "unlocked" or ((Game.TotalRolls or 0) >= 10 and "ready to unlock" or ("locked: " .. (Game.TotalRolls or 0) .. "/10 rolls"))
+		local cd = type(Game.Stats) == "table" and tonumber(Game.Stats.Cooldown) or nil
+		info.cooldown.Text = cd and (string.format("%.2f s", cd) .. (Cfg.rollDelay < cd and "  (the delay setting is below it)" or "")) or "-"
 		ui.autoButton.Text = auto and "Auto Roll: unlocked" or "Unlock Auto Roll"
 		info.zone.Text = Mod.zoneName(Derived.zone) .. " " .. luckText(Derived.luck)
 			.. (Derived.bestZone and Derived.bestZone ~= Derived.zone and ("  (best: " .. Mod.zoneName(Derived.bestZone) .. " " .. luckText(Derived.bestLuck) .. ")") or "")
@@ -3253,6 +3379,8 @@ local function refresh()
 			info.rebirthState.Text = "pick your perk in the game first"
 		elseif not why.valueOk then
 			info.rebirthState.Text = "needs more value"
+		elseif why.mutationsOk and not why.offerOk then
+			info.rebirthState.Text = "the mutations it needs are locked"
 		else
 			info.rebirthState.Text = needText and ("find " .. tostring(needText)) or "needs a mutation"
 		end
