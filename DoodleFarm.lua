@@ -105,6 +105,7 @@ local S = {
 	-- misc
 	antiAfk = true,
 	noRender = false,
+	verbose = false, -- log every move / heal decision
 }
 local NOT_SAVED = { battle = true, walk = true, farm = true, noRender = true }
 local settingsDirty = false
@@ -383,36 +384,64 @@ function G.canWalk()
 	return true
 end
 
-function G.hp(d)
-	local cur = tonumber(d.currenthp)
-	local max = type(d.Stats) == "table" and tonumber(d.Stats.hp) or nil
-	if cur and max and max > 0 then
-		return cur / max, cur <= 0
+-- Max HP.  Battle Doodles carry Stats.hp, but party entries from GetParty do not: the game's own party
+-- screen computes it with Utilities:GetStats(doodle).hp (pcall'd), so do the same.
+function G.maxHp(d)
+	if type(d.Stats) == "table" and tonumber(d.Stats.hp) then
+		return tonumber(d.Stats.hp)
+	end
+	local c = G.client
+	if c and c.Utilities and c.Utilities.GetStats then
+		local ok, st = pcall(function()
+			return c.Utilities:GetStats(d)
+		end)
+		if ok and type(st) == "table" and tonumber(st.hp) then
+			return tonumber(st.hp)
+		end
 	end
 end
 
--- party summary: count, alive, lowest hp ratio
+-- cur, max, ratio (ratio nil when max HP is unknown)
+function G.hp(d)
+	local cur = tonumber(d.currenthp)
+	if not cur then
+		return nil
+	end
+	local max = G.maxHp(d)
+	if max and max > 0 then
+		return cur, max, math.clamp(cur / max, 0, 1)
+	end
+	return cur, nil, nil
+end
+
+-- party summary: count, alive, fainted, lowest hp ratio, total current HP
 function G.partyInfo()
 	local ok, party = G.pds("GetParty")
 	if not ok or type(party) ~= "table" then
 		return nil
 	end
-	local info = { n = 0, alive = 0, fainted = 0, low = 1, unknown = 0 }
+	local info = { n = 0, alive = 0, fainted = 0, low = 1, unknown = 0, sum = 0, lowText = "" }
 	for _, d in pairs(party) do
 		if type(d) == "table" and d.Name then
 			info.n += 1
-			local ratio, dead = G.hp(d)
-			if ratio then
-				if dead then
+			local cur, max, ratio = G.hp(d)
+			if cur == nil then
+				info.unknown += 1
+			else
+				info.sum += cur
+				if cur <= 0 then
 					info.fainted += 1
 				else
 					info.alive += 1
 				end
-				if ratio < info.low then
-					info.low = ratio
+				if ratio then
+					if ratio < info.low then
+						info.low = ratio
+						info.lowText = string.format("%s %d/%d", tostring(d.Name), cur, max)
+					end
+				elseif cur > 0 and info.lowText == "" then
+					info.noMax = true -- HP known but not the maximum: cannot judge "low", only fainted
 				end
-			else
-				info.unknown += 1
 			end
 		end
 	end
@@ -557,6 +586,10 @@ local B = {
 	lastDiag = 0,
 	partyBad = {},
 	startedAt = 0,
+	turn = 0,
+	lastMove = nil,
+	movesLogged = false,
+	everLogged = false,
 }
 
 function B.can(name, gap)
@@ -621,37 +654,107 @@ function B.rareTag(bd)
 	return nil
 end
 
-function B.moveScore(m)
-	local txt = G.texts(m.b)
-	local cur = txt:match("(%d+)%s*/%s*%d+")
-	if cur and tonumber(cur) == 0 then
-		return -1000
+-- Move buttons Move1..4 are slots 1..4 of the active Doodle's Moves list ({Name, Uses = PP left}); the
+-- game's move table Client.Moves[name] has Type / Target (and presumably the power).  Prefer that data
+-- over reading numbers off the button text.
+local POWER_KEYS = { "Power", "BasePower", "BP", "Damage", "Dmg", "Pow" }
+local SELF_TARGETS = { Self = true, User = true, Ally = true, Allies = true, AllAllies = true, Field = true, Team = true }
+
+function B.active(bd)
+	if type(bd) ~= "table" then
+		return nil
+	end
+	for _, d in pairs(bd.Out1 or {}) do
+		if type(d) == "table" and type(d.Moves) == "table" and (tonumber(d.currenthp) or 1) > 0 then
+			return d
+		end
+	end
+end
+
+function B.moveInfo(name)
+	local c = G.client
+	local db = c and c.Moves
+	local info = type(db) == "table" and db[name]
+	return type(info) == "table" and info or nil
+end
+
+-- score from the battle data; nil when there is none for this slot
+function B.dataScore(i, mine)
+	local mv = mine and type(mine.Moves) == "table" and mine.Moves[i]
+	if type(mv) ~= "table" or not mv.Name then
+		return nil
+	end
+	local uses = tonumber(mv.Uses)
+	if uses and uses <= 0 then
+		return -1000, mv.Name
+	end
+	if type(mine.DisabledMoves) == "table" and table.find(mine.DisabledMoves, mv.Name) then
+		return -1000, mv.Name
 	end
 	local s = 0
+	local info = B.moveInfo(mv.Name)
+	if info then
+		local pw
+		for _, k in ipairs(POWER_KEYS) do
+			pw = tonumber(info[k])
+			if pw then
+				break
+			end
+		end
+		if pw then
+			s += pw <= 0 and -20 or pw / 10
+		end
+		if string.lower(tostring(info.Category or info.Class or info.Kind or info.Split or "")) == "status" then
+			s -= 20
+		end
+		if SELF_TARGETS[info.Target] then
+			s -= 30 -- buffs / heals are not what an auto fighter should spam
+		end
+		local acc = tonumber(info.Accuracy or info.Acc)
+		if acc and acc > 0 and acc <= 100 then
+			s += (acc - 100) / 20
+		end
+	end
+	return s, mv.Name
+end
+
+function B.moveScore(m, mine)
+	local ds, name = B.dataScore(m.i, mine)
+	if ds == -1000 then
+		return -1000, name
+	end
+	local s = ds or 0
+	if ds == nil then
+		-- no battle data: fall back to the PP printed on the button
+		local cur = G.texts(m.b):match("(%d+)%s*/%s*%d+")
+		if cur and tonumber(cur) == 0 then
+			return -1000
+		end
+	end
 	local eff = m.b:FindFirstChild("Effective")
 	if eff and G.shown(eff) then
 		local et = G.texts(eff)
 		local mult = tonumber(et:match("(%d*%.?%d+)%s*x")) or tonumber(et:match("x%s*(%d*%.?%d+)"))
 		if mult then
 			if mult == 0 then
-				s -= 6
+				s -= 30
 			elseif mult < 1 then
-				s -= 2
+				s -= 6
 			elseif mult >= 2 then
-				s += 3
+				s += 10
 			end
 		elseif et:find("super") or et:find("double") then
-			s += 3
+			s += 10
 		elseif et:find("no effect") or et:find("immune") then
-			s -= 6
+			s -= 30
 		elseif et:find("not very") or et:find("resist") or et:find("half") then
-			s -= 2
+			s -= 6
 		end
 	end
-	return s
+	return s, name
 end
 
-function B.pickMove(list)
+function B.pickMove(list, mine)
 	local now = os.clock()
 	local pool = {}
 	for _, m in ipairs(list) do
@@ -667,22 +770,62 @@ function B.pickMove(list)
 	local slot = tonumber(string.match(mode, "^Slot (%d)$"))
 	if slot then
 		for _, m in ipairs(pool) do
-			if m.i == slot then
-				return m
+			if m.i == slot and B.moveScore(m, mine) > -1000 then
+				return m, "slot " .. slot
 			end
 		end
+		-- that slot is empty / out of PP / disabled this turn: pick like Smart does
 	end
 	if mode == "Random" then
-		return pool[math.random(#pool)]
-	end
-	local best, bs
-	for _, m in ipairs(pool) do
-		local sc = B.moveScore(m)
-		if not bs or sc > bs then
-			best, bs = m, sc
+		local ok = {}
+		for _, m in ipairs(pool) do
+			if B.moveScore(m, mine) > -1000 then
+				ok[#ok + 1] = m
+			end
+		end
+		if #ok > 0 then
+			return ok[math.random(#ok)], "random"
 		end
 	end
-	return best
+	local best, bs, ties = nil, nil, {}
+	for _, m in ipairs(pool) do
+		local sc = B.moveScore(m, mine)
+		if not bs or sc > bs + 1e-9 then
+			best, bs, ties = m, sc, { m }
+		elseif math.abs(sc - bs) <= 1e-9 then
+			ties[#ties + 1] = m
+		end
+	end
+	if #ties > 1 then
+		-- nothing tells the moves apart: rotate instead of always hammering slot 1
+		B.turn += 1
+		best = ties[(B.turn - 1) % #ties + 1]
+	end
+	return best, string.format("score %.1f%s", bs or 0, #ties > 1 and (" tie of " .. #ties) or "")
+end
+
+-- one line per move (names, PP left, what the game's move table says) - lets a wrong guess be corrected
+function B.logMoves(mine)
+	local parts = {}
+	for i = 1, 4 do
+		local mv = mine.Moves[i]
+		if type(mv) == "table" and mv.Name then
+			local info = B.moveInfo(mv.Name)
+			local extra = ""
+			if info then
+				local keys = {}
+				for k, v in pairs(info) do
+					if type(v) == "number" or type(v) == "string" then
+						keys[#keys + 1] = tostring(k) .. "=" .. tostring(v):sub(1, 14)
+					end
+				end
+				table.sort(keys)
+				extra = " {" .. table.concat(keys, ",") .. "}"
+			end
+			parts[#parts + 1] = string.format("%d %s PP %s%s", i, mv.Name, tostring(mv.Uses), extra)
+		end
+	end
+	say(string.format("moves of %s: %s", tostring(mine.Name), table.concat(parts, " | ")))
 end
 
 local KEYS = { Fight = Enum.KeyCode.Q, Move1 = Enum.KeyCode.One, Move2 = Enum.KeyCode.Two, Move3 = Enum.KeyCode.Three, Move4 = Enum.KeyCode.Four }
@@ -749,6 +892,7 @@ function B.onStart()
 	B.wasIn = true
 	B.hold, B.skip, B.scanned = nil, false, false
 	B.bad, B.partyBad, B.cool = {}, {}, {}
+	B.lastMove, B.movesLogged = nil, false
 	B.lastAct = os.clock()
 	B.startedAt = os.clock()
 	B.state = "battle starting"
@@ -796,6 +940,16 @@ function B.step()
 			if S.rareAction == "Pause" then
 				B.hold = string.format("%s (%s)", name, tag)
 				say("auto battle paused for this fight - catch it yourself (Resume on the Auto tab continues)")
+			end
+		end
+	end
+	if bd and not B.movesLogged then
+		local mine = B.active(bd)
+		if mine then
+			B.movesLogged = true
+			if S.verbose or not B.everLogged then
+				B.everLogged = true
+				B.logMoves(mine)
 			end
 		end
 	end
@@ -853,7 +1007,7 @@ function B.step()
 	if st and G.shown(st) then
 		for i = 1, 4 do
 			local f = st:FindFirstChild("Front" .. i)
-			if f and G.shown(f) and B.can("target", 0.8) then
+			if f and G.shown(f) and B.can("target", 1.5) then
 				B.state = "picking target " .. i
 				B.lastAct = os.clock()
 				A.pressAny(f)
@@ -871,23 +1025,52 @@ function B.step()
 		end
 	end
 	if #list > 0 then
-		local m = B.pickMove(list)
-		if m and B.can("move", 0.8) then
-			if A.lastBtn == m.b then
-				B.bad[m.i] = os.clock()
+		B.state = "choosing a move"
+		-- one decision per turn: a second click on another move while the first is still being processed
+		-- would queue a different action, so after pressing wait for the menu to close (re-press the SAME
+		-- move after 3 s; only give up on it after 7 s)
+		if B.can("move", B.lastMove and 3.0 or 0.4) then -- a fresh menu (lastMove nil) may be answered at once
+			local now = os.clock()
+			local mine = B.active(bd)
+			local m, why
+			local lm = B.lastMove
+			if lm then
+				if now - lm.first >= 7 then
+					B.bad[lm.i] = now
+					say("move slot " .. lm.i .. " did not go through for 7 s - trying another")
+				else
+					for _, cand in ipairs(list) do
+						if cand.i == lm.i then
+							m, why = cand, "same move again"
+						end
+					end
+				end
 			end
-			B.state = "move " .. m.i
-			B.lastAct = os.clock()
-			STAT.fights += 1
-			A.press(m.b, KEYS["Move" .. m.i])
+			if not m then
+				m, why = B.pickMove(list, mine)
+				if m then
+					B.lastMove = { i = m.i, first = now }
+				end
+			end
+			if m then
+				local mv = mine and type(mine.Moves) == "table" and mine.Moves[m.i]
+				if S.verbose then
+					say(string.format("move: slot %d %s (%s)", m.i, tostring(mv and mv.Name or "?"), tostring(why)))
+				end
+				B.state = "move " .. m.i
+				B.lastAct = now
+				STAT.fights += 1
+				A.press(m.b, KEYS["Move" .. m.i])
+			end
 		end
 		return
 	end
+	B.lastMove = nil
 
 	-- fight menu
 	local fight = G.btn("Actions", "Fight")
 	if fight then
-		if B.can("fight", 0.8) then
+		if B.can("fight", 1.0) then
 			B.state = "fight menu"
 			B.lastAct = os.clock()
 			A.press(fight, KEYS.Fight)
@@ -1189,25 +1372,30 @@ loop("heal", 3, function()
 	end
 	H.nextTry = os.clock() + 25
 	local before = info
-	say(string.format("heal: party low (%d%%, %d fainted) - sending Heal", math.floor(info.low * 100), info.fainted))
-	G.pdsEvent("Heal")
-	task.wait(2)
-	local after = G.partyInfo()
-	if after then
-		H.last, H.infoAt = after, os.clock()
-		if after.fainted < before.fainted or after.low > before.low + 0.05 then
-			STAT.heals += 1
-			H.fail = 0
-			H.note = "healed"
-			say("heal worked")
-			return
+	say(string.format("heal: %s (%d%%), %d fainted, total HP %d - trying the remote heal", info.lowText ~= "" and info.lowText or "party", math.floor(info.low * 100), info.fainted, info.sum))
+	-- "Heal" is what the story scripts send; "HealNoFaint" (heals the living, not the fainted) is the other one
+	local order = H.good == "HealNoFaint" and { "HealNoFaint", "Heal" } or { "Heal", "HealNoFaint" }
+	for _, ev in ipairs(order) do
+		G.pdsEvent(ev)
+		task.wait(2)
+		local after = G.partyInfo()
+		if after then
+			H.last, H.infoAt = after, os.clock()
+			if after.fainted < before.fainted or after.sum > before.sum then
+				STAT.heals += 1
+				H.fail, H.good = 0, ev
+				H.note = "healed (" .. ev .. ")"
+				say(string.format("heal worked via %s: total HP %d -> %d, fainted %d -> %d", ev, before.sum, after.sum, before.fainted, after.fainted))
+				return
+			end
 		end
 	end
 	H.fail += 1
 	H.note = "heal had no effect (" .. H.fail .. ")"
+	say("heal: neither Heal nor HealNoFaint changed any HP (" .. H.fail .. "/3)")
 	if H.fail >= 3 then
 		H.off = true
-		say("heal: the server ignores a remote Heal here. Use a healing station / let a whiteout heal you; auto heal is off until you press Re-enable.")
+		say("heal: the server ignores a remote heal here. Use a healing station / let a whiteout heal you; auto heal is off until you press Re-enable.")
 	end
 end)
 
@@ -1515,9 +1703,29 @@ function M.debug()
 	end
 	local info = G.partyInfo()
 	if info then
-		say(string.format("party: %d Doodles, %d alive, %d fainted, lowest HP %d%% (unknown HP: %d)", info.n, info.alive, info.fainted, math.floor(info.low * 100), info.unknown))
+		say(string.format("party: %d Doodles, %d alive, %d fainted, lowest HP %d%% (%s), total HP %d, unknown HP: %d%s", info.n, info.alive, info.fainted, math.floor(info.low * 100), info.lowText ~= "" and info.lowText or "-", info.sum, info.unknown, info.noMax and " | max HP unreadable" or ""))
+		local okP, party = G.pds("GetParty")
+		if okP and type(party) == "table" then
+			local rows = {}
+			for _, d in pairs(party) do
+				if type(d) == "table" and d.Name then
+					local cur, max = G.hp(d)
+					rows[#rows + 1] = string.format("%s %s/%s", tostring(d.Name), tostring(cur), tostring(max))
+				end
+			end
+			say("party HP: " .. table.concat(rows, " | "))
+		end
 	else
 		say("party: GetParty failed")
+	end
+	do
+		local bd = G.currentBattle()
+		local mine = bd and B.active(bd)
+		if mine then
+			B.logMoves(mine)
+		else
+			say("moves: no active battle Doodle found (not in a battle?)")
+		end
 	end
 	say("farm: " .. FM.lastInfo .. " | " .. FM.note)
 	say("claims: gifts " .. CL.note .. " | mail " .. CL.mailNote .. " | BP snapshot " .. (CL.bp and ("tier " .. tostring(CL.bp.CT)) or "none"))
@@ -2008,6 +2216,7 @@ UI.toggle(pMisc, "Anti AFK", "antiAfk")
 UI.toggle(pMisc, "Turn 3D rendering off (saves CPU / GPU)", "noRender", function()
 	M.render()
 end)
+UI.toggle(pMisc, "Verbose log (every move / heal decision)", "verbose")
 UI.button(pMisc, "Debug info -> log", M.debug, Col.off)
 UI.button(pMisc, "Copy log to clipboard", function()
 	if setclipboard then
@@ -2061,7 +2270,7 @@ loop("ui", 0.5, function()
 	stLines[1].Text = string.format("%s  |  roam: %s", B.state, W.note)
 	local pi = H.last
 	if pi then
-		stLines[2].Text = string.format("Party: %d Doodles, %d alive, lowest HP %d%%  |  heal: %s", pi.n, pi.alive, math.floor(pi.low * 100), H.off and "gave up" or H.note)
+		stLines[2].Text = string.format("Party: %d, %d alive, lowest %s %d%%  |  heal: %s", pi.n, pi.alive, pi.lowText ~= "" and pi.lowText or "-", math.floor(pi.low * 100), H.off and "gave up" or H.note)
 	else
 		stLines[2].Text = "Party: reading..."
 	end
