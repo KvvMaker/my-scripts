@@ -359,19 +359,26 @@ function G.inBattle()
 	local mb = G.bbar()
 	return mb ~= nil and mb.Visible == true
 end
+-- returns ok, reason
 function G.canWalk()
 	local c = G.client
 	if not c then
 		return true
 	end
-	if c.Controls and c.Controls.CanWalk and c.Controls:CanWalk() ~= true then
-		return false
+	if c.Controls and c.Controls.CanWalk then
+		local cw = c.Controls:CanWalk()
+		if cw ~= true then
+			return false, "game has walking off (CanWalk=" .. tostring(cw) .. ": loading / cutscene / menu)"
+		end
+	end
+	if c.InCutscene then
+		return false, "cutscene"
 	end
 	if c.Talky and c.Talky.Visible then
-		return false
+		return false, "dialogue open"
 	end
 	if c.Menu and c.Menu.Active then
-		return false
+		return false, "menu open"
 	end
 	return true
 end
@@ -953,32 +960,47 @@ local W = {
 	lastT = 0,
 	stuck = 0,
 	miss = 0,
+	nextPick = 0,
+	relaxed = false, -- grass check dropped because nothing around passed it
+	steps = 0,
 	note = "off",
 	nextFind = 0,
 	grass = { Grass = true, WildGrass = true, CoveGrass = true, IceGrass = true, DesertGrass = true, WaterGrass = true },
 }
 
-function W.ground(pos, char)
+-- what is under (x, z): the game's own check is a downward ray that ignores the character and Terrain
+-- and looks at the part's name.  Try from just above, then from high up (a roof / tree can eat the first ray).
+function W.ground(x, z, y, char)
 	local p = RaycastParams.new()
 	p.FilterType = Enum.RaycastFilterType.Exclude
 	p.FilterDescendantsInstances = { char, Workspace.Terrain }
-	return Workspace:Raycast(Vector3.new(pos.X, pos.Y + 14, pos.Z), Vector3.new(0, -60, 0), p)
+	local hit = Workspace:Raycast(Vector3.new(x, y + 6, z), Vector3.new(0, -50, 0), p)
+	if S.grassOnly and not W.relaxed and not (hit and W.grass[hit.Instance.Name]) then
+		local hit2 = Workspace:Raycast(Vector3.new(x, y + 40, z), Vector3.new(0, -90, 0), p)
+		if hit2 and W.grass[hit2.Instance.Name] then
+			return hit2
+		end
+	end
+	return hit
 end
 
 function W.pick(char, hrp)
 	local base = W.anchor or hrp.Position
-	for _ = 1, 14 do
-		local a, r = math.random() * math.pi * 2, math.sqrt(math.random()) * S.walkRadius
-		local p = Vector3.new(base.X + math.cos(a) * r, base.Y, base.Z + math.sin(a) * r)
-		local hit = W.ground(p, char)
-		if hit and math.abs(hit.Position.Y - base.Y) < 7 and (not S.grassOnly or W.grass[hit.Instance.Name]) then
+	local needGrass = S.grassOnly and not W.relaxed
+	local y = hrp.Position.Y
+	for i = 1, 14 do
+		-- full radius first, then smaller rings (the grass patch may be smaller than the radius)
+		local scale = i <= 6 and 1 or (i <= 10 and 0.6 or 0.3)
+		local a, r = math.random() * math.pi * 2, math.sqrt(math.random()) * S.walkRadius * scale
+		local x, z = base.X + math.cos(a) * r, base.Z + math.sin(a) * r
+		local hit = W.ground(x, z, y, char)
+		if hit and math.abs(hit.Position.Y - y) < 10 and (not needGrass or W.grass[hit.Instance.Name]) then
 			W.target = hit.Position
 			W.expire = os.clock() + 7
 			W.miss = 0
 			return true
 		end
 	end
-	W.miss += 1
 	return false
 end
 
@@ -1023,11 +1045,12 @@ function W.setAnchor()
 	if hrp then
 		W.anchor = hrp.Position
 		W.target = nil
+		W.relaxed, W.miss, W.nextPick = false, 0, 0
 		say("roam anchor set to your position")
 	end
 end
 
-track(RunService.Heartbeat:Connect(function()
+function W.step()
 	if not alive then
 		return
 	end
@@ -1042,11 +1065,19 @@ track(RunService.Heartbeat:Connect(function()
 	if hum.Health <= 0 then
 		return
 	end
-	if not G.canWalk() or G.inBattle() then
+	local can, why = G.canWalk()
+	if not can or G.inBattle() then
 		if W.target then
 			W.stop(hum)
 		end
-		W.note = "paused (battle / menu / cutscene)"
+		W.note = "paused: " .. (G.inBattle() and "in battle" or tostring(why))
+		return
+	end
+	if hum.WalkSpeed <= 0 or hrp.Anchored then
+		if W.target then
+			W.stop(hum)
+		end
+		W.note = "paused: the game froze the character (WalkSpeed 0 / anchored)"
 		return
 	end
 	local now = os.clock()
@@ -1058,12 +1089,25 @@ track(RunService.Heartbeat:Connect(function()
 		if flat > S.walkRadius + 40 then
 			W.target = Vector3.new(W.anchor.X, hrp.Position.Y, W.anchor.Z)
 			W.expire = now + 10
-		elseif not W.pick(char, hrp) then
-			if S.grassOnly and W.miss >= 3 then
-				W.findGrass(hrp)
+		else
+			if now < W.nextPick then
+				return
 			end
-			W.note = "looking for grass..."
-			return
+			if not W.pick(char, hrp) then
+				-- never ray-cast every frame; and never stand still just because the grass test fails
+				W.nextPick = now + 0.6
+				W.miss += 1
+				W.note = "no grass point found (try " .. W.miss .. ")"
+				if S.grassOnly and not W.relaxed then
+					if W.miss == 2 then
+						W.findGrass(hrp)
+					elseif W.miss >= 5 then
+						W.relaxed = true
+						say("roam: no grass found around the anchor - walking without the grass check. Stand on grass and press 'Set anchor' to get it back.")
+					end
+				end
+				return
+			end
 		end
 	end
 	local d = Vector3.new(W.target.X - hrp.Position.X, 0, W.target.Z - hrp.Position.Z)
@@ -1071,7 +1115,8 @@ track(RunService.Heartbeat:Connect(function()
 		W.target = nil
 		return
 	end
-	W.note = "walking"
+	W.note = W.relaxed and "walking (no grass check)" or "walking"
+	W.steps += 1
 	pcall(function()
 		hum:Move(d.Unit, false)
 	end)
@@ -1087,7 +1132,33 @@ track(RunService.Heartbeat:Connect(function()
 		end
 		W.lastPos, W.lastT = hrp.Position, now
 	end
-end))
+end
+
+-- The game uses Roblox's PlayerModule: its ControlModule calls Humanoid:Move(0) every render frame at
+-- RenderPriority.Input, which cancels a Move made later (e.g. in Heartbeat).  The game's own minigames
+-- override it by binding at Input + 1, so do the same.
+do
+	local name = "DoodleFarmRoam"
+	local okBind = pcall(function()
+		RunService:BindToRenderStep(name, Enum.RenderPriority.Input.Value + 1, function()
+			local ok, err = pcall(W.step)
+			if not ok and lastErr.roam ~= tostring(err) then
+				lastErr.roam = tostring(err)
+				say("roam error: " .. tostring(err))
+			end
+		end)
+	end)
+	if okBind then
+		onUnload(function()
+			pcall(function()
+				RunService:UnbindFromRenderStep(name)
+			end)
+		end)
+	else
+		track(RunService.Heartbeat:Connect(W.step))
+		say("roam: BindToRenderStep not available - using Heartbeat (the game's controls may cancel it)")
+	end
+end
 
 --// ---------------------------------------------------------------- heal
 local H = { last = nil, fail = 0, nextTry = 0, off = false, note = "-", infoAt = 0 }
@@ -1451,6 +1522,16 @@ function M.debug()
 	say("farm: " .. FM.lastInfo .. " | " .. FM.note)
 	say("claims: gifts " .. CL.note .. " | mail " .. CL.mailNote .. " | BP snapshot " .. (CL.bp and ("tier " .. tostring(CL.bp.CT)) or "none"))
 	say("roam: " .. W.note .. " | heal: " .. H.note .. (H.off and " (OFF)" or ""))
+	local char, hrp, hum = U.me()
+	if hrp and hum then
+		local can, why = G.canWalk()
+		local under = "?"
+		pcall(function()
+			local hit = W.ground(hrp.Position.X, hrp.Position.Z, hrp.Position.Y, char)
+			under = hit and hit.Instance.Name or "nothing"
+		end)
+		say(string.format("roam detail: canWalk=%s%s walkSpeed=%s anchored=%s part under feet='%s' relaxed=%s steps=%d anchor=%s", tostring(can), can and "" or (" (" .. tostring(why) .. ")"), tostring(hum.WalkSpeed), tostring(hrp.Anchored), under, tostring(W.relaxed), W.steps, W.anchor and string.format("%d,%d", W.anchor.X, W.anchor.Z) or "none"))
+	end
 end
 
 --// ---------------------------------------------------------------- unload
